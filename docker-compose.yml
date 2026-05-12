@@ -1,0 +1,6 @@
+services:
+  midea-api:
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    env_file: .env
