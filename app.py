@@ -17,12 +17,12 @@ from midea_beautiful.cloud import _decode_from_csv, _encode_as_csv
 
 ACCOUNT = os.environ["MIDEA_ACCOUNT"]
 PASSWORD = os.environ["MIDEA_PASSWORD"]
-APPLIANCE_ID = os.environ.get("APPLIANCE_ID", "150633094559931")
-HOMEGROUP_ID = os.environ.get("HOMEGROUP_ID", "140782967411273728")
 PORT = int(os.environ.get("PORT", "8099"))
+CACHE_FILE = os.environ.get("CACHE_FILE", "/app/data/appliance.json")
 
 app = Flask(__name__)
 _cloud = None
+_appliance_config = None
 
 
 def _get_cloud():
@@ -36,8 +36,50 @@ def _get_cloud():
     return _cloud
 
 
+def _discover_appliance(cloud) -> dict:
+    """Fetch appliance list from cloud and return the first dehumidifier found."""
+    raw = cloud.api_request("/v1/appliance/user/list/get", {})
+    appliances = raw.get("list", [])
+    if not appliances:
+        raise RuntimeError("No appliances found on this account")
+
+    # Prefer a dehumidifier (type 0xA1), otherwise take the first appliance
+    match = next(
+        (a for a in appliances if a.get("type", "").lower() == "0xa1"),
+        appliances[0],
+    )
+    return {
+        "appliance_id": match["id"],
+        "homegroup_id": match.get("homegroupId", ""),
+        "name": match.get("name", ""),
+        "type": match.get("type", ""),
+    }
+
+
+def _get_appliance_config() -> dict:
+    global _appliance_config
+    if _appliance_config is not None:
+        return _appliance_config
+
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE) as f:
+            _appliance_config = json.load(f)
+        print(f"Loaded appliance config from {CACHE_FILE}: {_appliance_config}")
+        return _appliance_config
+
+    print("No cached appliance config found — discovering from cloud...")
+    cloud = _get_cloud()
+    _appliance_config = _discover_appliance(cloud)
+    os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+    with open(CACHE_FILE, "w") as f:
+        json.dump(_appliance_config, f, indent=2)
+    print(f"Discovered and cached appliance config: {_appliance_config}")
+    return _appliance_config
+
+
 def _transparent_send(cmd_bytes: bytes) -> bytes:
     cloud = _get_cloud()
+    cfg = _get_appliance_config()
     user_id = int(cloud._session["userId"])
 
     encoded = _encode_as_csv(cmd_bytes)
@@ -59,8 +101,8 @@ def _transparent_send(cmd_bytes: bytes) -> bytes:
         "order": order,
         "funId": "0000",
         "isFull": False,
-        "applianceCode": APPLIANCE_ID,
-        "homegroupId": HOMEGROUP_ID,
+        "applianceCode": cfg["appliance_id"],
+        "homegroupId": cfg["homegroup_id"],
         "waitResp": True,
     }
     payload = json.dumps(body)
@@ -91,7 +133,8 @@ def _transparent_send(cmd_bytes: bytes) -> bytes:
 
 def fetch_status() -> dict:
     global _cloud
-    appliance = DehumidifierAppliance(APPLIANCE_ID)
+    cfg = _get_appliance_config()
+    appliance = DehumidifierAppliance(cfg["appliance_id"])
     cmd_bytes = appliance.refresh_command().finalize()
     try:
         raw = _transparent_send(cmd_bytes)
@@ -133,5 +176,6 @@ def health():
 
 
 if __name__ == "__main__":
-    _get_cloud()  # authenticate on startup
+    _get_cloud()
+    _get_appliance_config()
     app.run(host="0.0.0.0", port=PORT)
