@@ -4,21 +4,37 @@ import secrets
 from time import time
 from secrets import token_hex
 
-# Patch the hardcoded deviceId before any midea_beautiful imports
-# The fixed default causes Midea's session limit (error 65027) to trigger
+# Patch the hardcoded deviceId before any midea_beautiful imports.
+# The fixed default causes Midea's session limit (error 65027).
+# We persist our own deviceId so restarts reuse the same session slot.
 import midea_beautiful.cloud as _mba_cloud
-_mba_cloud.CLOUD_API_DEVICE_ID = secrets.token_hex(8)
 
 import requests
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from midea_beautiful import connect_to_cloud
 from midea_beautiful.appliance import DehumidifierAppliance
 from midea_beautiful.cloud import _decode_from_csv, _encode_as_csv
+from midea_beautiful.command import DehumidifierSetCommand
 
 ACCOUNT = os.environ["MIDEA_ACCOUNT"]
 PASSWORD = os.environ["MIDEA_PASSWORD"]
 PORT = int(os.environ.get("PORT", "8099"))
-CACHE_FILE = os.environ.get("CACHE_FILE", "/app/data/appliance.json")
+DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
+CACHE_FILE = os.path.join(DATA_DIR, "appliance.json")
+DEVICE_ID_FILE = os.path.join(DATA_DIR, "device_id")
+
+def _load_or_create_device_id() -> str:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if os.path.exists(DEVICE_ID_FILE):
+        with open(DEVICE_ID_FILE) as f:
+            return f.read().strip()
+    device_id = secrets.token_hex(8)
+    with open(DEVICE_ID_FILE, "w") as f:
+        f.write(device_id)
+    return device_id
+
+
+_mba_cloud.CLOUD_API_DEVICE_ID = _load_or_create_device_id()
 
 app = Flask(__name__)
 _cloud = None
@@ -170,12 +186,78 @@ def status():
         return jsonify({"error": str(e)}), 503
 
 
+@app.route("/set")
+def set_state():
+    """Set one or more appliance properties via query params.
+
+    Supported params:
+      target_humidity  int   35-85
+      fan_speed        int   40=low, 60=medium, 80=high
+      running          bool  true/false
+      mode             int   1=target, 2=continuous, 3=smart, 4=dry
+      pump             bool  true/false
+      ion_mode         bool  true/false
+      sleep_mode       bool  true/false
+    """
+    def parse_bool(v):
+        return v.lower() in ("1", "true", "yes", "on")
+
+    try:
+        global _cloud
+        cfg = _get_appliance_config()
+        cmd = DehumidifierSetCommand()
+
+        applied = {}
+        if "target_humidity" in request.args:
+            val = int(request.args["target_humidity"])
+            if not 35 <= val <= 85:
+                return jsonify({"error": "target_humidity must be 35–85"}), 400
+            cmd.target_humidity = val
+            applied["target_humidity"] = val
+        if "fan_speed" in request.args:
+            val = int(request.args["fan_speed"])
+            cmd.fan_speed = val
+            applied["fan_speed"] = val
+        if "running" in request.args:
+            val = parse_bool(request.args["running"])
+            cmd.running = val
+            applied["running"] = val
+        if "mode" in request.args:
+            val = int(request.args["mode"])
+            cmd.mode = val
+            applied["mode"] = val
+        if "pump" in request.args:
+            val = parse_bool(request.args["pump"])
+            cmd.pump_switch = val
+            applied["pump"] = val
+        if "ion_mode" in request.args:
+            val = parse_bool(request.args["ion_mode"])
+            cmd.ion_mode = val
+            applied["ion_mode"] = val
+        if "sleep_mode" in request.args:
+            val = parse_bool(request.args["sleep_mode"])
+            cmd.sleep_switch = val
+            applied["sleep_mode"] = val
+
+        if not applied:
+            return jsonify({"error": "No valid parameters provided"}), 400
+
+        cmd_bytes = cmd.finalize()
+        try:
+            _transparent_send(cmd_bytes)
+        except Exception:
+            _cloud = None
+            _transparent_send(cmd_bytes)
+
+        return jsonify({"ok": True, "applied": applied})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 503
+
+
 @app.route("/health")
 def health():
     return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
-    _get_cloud()
-    _get_appliance_config()
     app.run(host="0.0.0.0", port=PORT)
