@@ -2,7 +2,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir midea-beautiful-air flask
+# Exact versions (pip freeze of the image that ran until 2026-11-10); bump them on purpose, not by rebuilding.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 
