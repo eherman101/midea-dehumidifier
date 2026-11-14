@@ -147,6 +147,24 @@ def _transparent_send(cmd_bytes: bytes) -> bytes:
     return _decode_from_csv(decrypted)
 
 
+# Modes as reported by the unit: 1=target, 2=continuous, 3=smart, 4=dry.
+ALWAYS_DRYING_MODES = (2, 4)
+
+
+def _dehumidifying(appliance) -> bool:
+    """Whether the unit is actively drying the air, as opposed to merely powered on.
+
+    The status reply has no compressor flag (checked 2026-11-14 by forcing a run: no byte
+    changed), so this is derived: powered on, tank not full, not defrosting, and either a
+    mode that always dries or room humidity at/above the target.
+    """
+    if not appliance.running or appliance.tank_full or appliance.defrosting:
+        return False
+    if appliance.mode in ALWAYS_DRYING_MODES:
+        return True
+    return appliance.current_humidity >= appliance.target_humidity
+
+
 def fetch_status() -> dict:
     global _cloud
     cfg = _get_appliance_config()
@@ -162,6 +180,7 @@ def fetch_status() -> dict:
     appliance.process_response(raw[10:])
     return {
         "running": appliance.running,
+        "dehumidifying": _dehumidifying(appliance),
         "current_humidity": appliance.current_humidity,
         "current_temperature": appliance.current_temperature,
         "target_humidity": appliance.target_humidity,
@@ -204,8 +223,17 @@ def set_state():
 
     try:
         global _cloud
-        cfg = _get_appliance_config()
+        # A set command carries every setting, so seed it with the current state; otherwise
+        # the fields not given here fall back to defaults (power off, low fan).
+        current = fetch_status()
         cmd = DehumidifierSetCommand()
+        cmd.running = current["running"]
+        cmd.target_humidity = current["target_humidity"]
+        cmd.fan_speed = current["fan_speed"]
+        cmd.mode = current["mode"]
+        cmd.pump_switch = current["pump"]
+        cmd.ion_mode = current["ion_mode"]
+        cmd.sleep_switch = current["sleep_mode"]
 
         applied = {}
         if "target_humidity" in request.args:
